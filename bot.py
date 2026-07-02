@@ -5,12 +5,6 @@ Usa python-telegram-bot v20+ (async)
 Variabili d'ambiente richieste:
     TELEGRAM_TOKEN   — token del bot (@BotFather)
     ALLOWED_USER_ID  — (opzionale) tuo user_id Telegram per uso privato
-
-Comandi:
-    /start           — benvenuto
-    /anime <query>   — cerca su AnimeUnity
-    /film  <query>   — cerca su StreamingCommunity
-    /help            — lista comandi
 """
 
 import asyncio
@@ -25,6 +19,7 @@ from telegram import (
     Update,
 )
 from telegram.constants import ParseMode
+from telegram.error import TimedOut, NetworkError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -39,7 +34,7 @@ from animeunity import AnimeUnity
 from streamingcommunity import StreamingCommunity
 
 # ---------------------------------------------------------------------------
-# Setup logging
+# Logging
 # ---------------------------------------------------------------------------
 
 logging.basicConfig(
@@ -49,17 +44,14 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Costanti conversazione
+# Stati conversazione
 # ---------------------------------------------------------------------------
 
-# AnimeUnity states
-AU_RESULTS, AU_EPISODES, AU_WAITING_EP = range(3)
-
-# StreamingCommunity states
-SC_RESULTS, SC_EPISODES, SC_WAITING_EP = range(10, 13)
+AU_RESULTS, AU_EPISODES = range(2)
+SC_RESULTS, SC_EPISODES = range(10, 12)
 
 # ---------------------------------------------------------------------------
-# Controllo accesso opzionale
+# Accesso
 # ---------------------------------------------------------------------------
 
 ALLOWED_USER_ID = os.getenv("ALLOWED_USER_ID")
@@ -73,39 +65,37 @@ async def deny(update: Update) -> None:
     await update.effective_message.reply_text("⛔ Non autorizzato.")
 
 # ---------------------------------------------------------------------------
-# Helpers UI
+# Helper: chiave titolo unificata
+# AnimeUnity  → "title"
+# StreamingCommunity → "name"
+# ---------------------------------------------------------------------------
+
+def _get_title(item: dict) -> str:
+    return item.get("title") or item.get("name") or "?"
+
+# ---------------------------------------------------------------------------
+# UI helpers
 # ---------------------------------------------------------------------------
 
 def _chunk(lst: list, n: int) -> list[list]:
-    """Divide una lista in righe da n elementi."""
     return [lst[i:i+n] for i in range(0, len(lst), n)]
 
 def _results_keyboard(results: list[dict], prefix: str) -> InlineKeyboardMarkup:
-    """
-    Crea una tastiera inline con un bottone per ogni risultato.
-    callback_data = "prefix:index"
-    """
     buttons = [
         InlineKeyboardButton(
-            text=f"{'🎬' if r.get('type')=='movie' else '📺'} {r['name'][:40]}",
+            text=f"{'🎬' if r.get('type')=='movie' else '📺'} {_get_title(r)[:40]}",
             callback_data=f"{prefix}:{i}",
         )
         for i, r in enumerate(results)
     ]
-    # 1 bottone per riga (titoli lunghi)
     keyboard = [[b] for b in buttons]
     keyboard.append([InlineKeyboardButton("❌ Annulla", callback_data=f"{prefix}:cancel")])
     return InlineKeyboardMarkup(keyboard)
 
 def _episodes_keyboard(episodes: list[dict], prefix: str, page: int = 0) -> InlineKeyboardMarkup:
-    """
-    Tastiera episodi con paginazione da 20 per volta.
-    callback_data = "prefix:ep:ep_index"
-    callback_data = "prefix:page:N"
-    """
     page_size = 20
-    start = page * page_size
-    page_eps = episodes[start:start + page_size]
+    start     = page * page_size
+    page_eps  = episodes[start:start + page_size]
 
     buttons = [
         InlineKeyboardButton(
@@ -131,37 +121,49 @@ def _episodes_keyboard(episodes: list[dict], prefix: str, page: int = 0) -> Inli
     return InlineKeyboardMarkup(rows)
 
 def _ep_label(ep: dict) -> str:
-    """Etichetta breve per un episodio."""
     if "season_number" in ep:
         return f"S{ep['season_number']:02d}E{ep['number']:02d}"
     return f"Ep {ep['number']}"
 
-def _info_text(info: dict) -> str:
-    """Testo formattato dei dettagli di un titolo."""
-    lines = [f"*{_esc(info['name'])}*"]
-    if info.get("year"):
-        lines[0] += f" \\({info['year']}\\)"
-    if info.get("score"):
-        lines.append(f"⭐ {_esc(info['score'])}")
-    if info.get("genres"):
-        lines.append(f"🎭 {_esc(', '.join(info['genres'][:4]))}")
-    if info.get("plot"):
-        plot = info["plot"][:200] + ("…" if len(info["plot"]) > 200 else "")
-        lines.append(f"\n_{_esc(plot)}_")
-    return "\n".join(lines)
-
 def _esc(text: str) -> str:
-    """Escape caratteri speciali MarkdownV2."""
     return re.sub(r"([_*\[\]()~`>#+\-=|{}.!\\])", r"\\\1", str(text))
 
-def _link_text(name: str, m3u8: str | None) -> str:
+def _info_text(info: dict) -> str:
+    name  = _get_title(info)
+    lines = [f"*{_esc(name)}*"]
+    year  = info.get("year") or info.get("date", "")
+    if year:
+        lines[0] += f" \\({_esc(str(year)[:4])}\\)"
+    score = info.get("score")
+    if score:
+        lines.append(f"⭐ {_esc(str(score))}")
+    genres = info.get("genres", [])
+    if genres:
+        lines.append(f"🎭 {_esc(', '.join(genres[:4]))}")
+    plot = info.get("plot", "")
+    if plot:
+        short = plot[:200] + ("…" if len(plot) > 200 else "")
+        lines.append(f"\n_{_esc(short)}_")
+    return "\n".join(lines)
+
+def _link_text(label: str, m3u8: str | None) -> str:
     if not m3u8:
-        return "❌ Link non trovato\\."
+        return f"❌ Link non trovato per *{_esc(label)}*\\."
     return (
-        f"✅ *{_esc(name)}*\n\n"
+        f"✅ *{_esc(label)}*\n\n"
         f"`{_esc(m3u8)}`\n\n"
         f"Copia il link e aprilo con mpv o VLC\\."
     )
+
+async def _safe_answer(query) -> None:
+    """answer() con retry su TimedOut — va chiamato subito all'inizio di ogni callback."""
+    for attempt in range(3):
+        try:
+            await query.answer()
+            return
+        except (TimedOut, NetworkError):
+            if attempt < 2:
+                await asyncio.sleep(1)
 
 # ---------------------------------------------------------------------------
 # /start  /help
@@ -174,12 +176,35 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "👋 Benvenuto\\!\n\n"
         "*/anime* \\<titolo\\> — cerca su AnimeUnity\n"
         "*/film* \\<titolo\\> — cerca su StreamingCommunity\n"
+        "*/cancel* — annulla operazione in corso\n"
         "*/help* — questo messaggio",
         parse_mode=ParseMode.MARKDOWN_V2,
     )
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await cmd_start(update, ctx)
+
+# ---------------------------------------------------------------------------
+# Error handler globale
+# ---------------------------------------------------------------------------
+
+async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    err = ctx.error
+    log.error("Eccezione:", exc_info=err)
+
+    if isinstance(err, (TimedOut, NetworkError)):
+        # Errori di rete transitori — non avvisare l'utente
+        return
+
+    # Avvisa l'utente per altri errori
+    if isinstance(update, Update) and update.effective_message:
+        try:
+            await update.effective_message.reply_text(
+                f"❌ Errore inatteso: {_esc(str(err))}",
+                parse_mode=ParseMode.MARKDOWN_V2,
+            )
+        except Exception:
+            pass
 
 # ---------------------------------------------------------------------------
 # ── ANIMEUNITY ──────────────────────────────────────────────────────────────
@@ -197,7 +222,9 @@ async def cmd_anime(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         await update.message.reply_text("Uso: /anime \\<titolo\\>", parse_mode=ParseMode.MARKDOWN_V2)
         return ConversationHandler.END
 
-    msg = await update.message.reply_text(f"🔍 Cerco *{_esc(query)}* su AnimeUnity…", parse_mode=ParseMode.MARKDOWN_V2)
+    msg = await update.message.reply_text(
+        f"🔍 Cerco *{_esc(query)}* su AnimeUnity…", parse_mode=ParseMode.MARKDOWN_V2
+    )
     try:
         results = await asyncio.get_event_loop().run_in_executor(None, _au(ctx).search, query)
     except Exception as e:
@@ -209,7 +236,6 @@ async def cmd_anime(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         return ConversationHandler.END
 
     ctx.user_data["au_results"] = results
-    ctx.user_data["au_msg_id"] = msg.message_id
     await msg.edit_text(
         f"🔍 Risultati per *{_esc(query)}*:",
         reply_markup=_results_keyboard(results, "au_r"),
@@ -218,39 +244,35 @@ async def cmd_anime(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     return AU_RESULTS
 
 async def au_pick_result(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    data = query.data  # "au_r:N" | "au_r:cancel"
+    q = update.callback_query
+    await _safe_answer(q)
 
-    if data.endswith(":cancel"):
-        await query.edit_message_text("Annullato\\.", parse_mode=ParseMode.MARKDOWN_V2)
+    if q.data.endswith(":cancel"):
+        await q.edit_message_text("Annullato\\.", parse_mode=ParseMode.MARKDOWN_V2)
         return ConversationHandler.END
 
-    idx     = int(data.split(":")[1])
-    results = ctx.user_data["au_results"]
-    chosen  = results[idx]
+    idx     = int(q.data.split(":")[1])
+    chosen  = ctx.user_data["au_results"][idx]
+    name    = _get_title(chosen)
 
-    await query.edit_message_text(
-        f"⏳ Carico *{_esc(chosen['name'])}*…", parse_mode=ParseMode.MARKDOWN_V2
+    await q.edit_message_text(
+        f"⏳ Carico *{_esc(name)}*…", parse_mode=ParseMode.MARKDOWN_V2
     )
-
     try:
-        info = await asyncio.get_event_loop().run_in_executor(
-            None, _au(ctx).load, chosen["url"]
-        )
+        info = await asyncio.get_event_loop().run_in_executor(None, _au(ctx).load, chosen["url"])
     except Exception as e:
-        await query.edit_message_text(f"❌ Errore: {_esc(str(e))}", parse_mode=ParseMode.MARKDOWN_V2)
+        await q.edit_message_text(f"❌ Errore: {_esc(str(e))}", parse_mode=ParseMode.MARKDOWN_V2)
         return ConversationHandler.END
 
     ctx.user_data["au_info"] = info
     eps = info["episodes"]
 
     if not eps:
-        await query.edit_message_text("Nessun episodio disponibile\\.", parse_mode=ParseMode.MARKDOWN_V2)
+        await q.edit_message_text("Nessun episodio disponibile\\.", parse_mode=ParseMode.MARKDOWN_V2)
         return ConversationHandler.END
 
     text = _info_text(info) + f"\n\n📋 *{len(eps)} episodi disponibili*"
-    await query.edit_message_text(
+    await q.edit_message_text(
         text,
         reply_markup=_episodes_keyboard(eps, "au_e"),
         parse_mode=ParseMode.MARKDOWN_V2,
@@ -258,20 +280,20 @@ async def au_pick_result(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     return AU_EPISODES
 
 async def au_pick_episode(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    data = query.data
+    q    = update.callback_query
+    await _safe_answer(q)
+    data = q.data
     info = ctx.user_data["au_info"]
     eps  = info["episodes"]
 
     if data.endswith(":cancel"):
-        await query.edit_message_text("Annullato\\.", parse_mode=ParseMode.MARKDOWN_V2)
+        await q.edit_message_text("Annullato\\.", parse_mode=ParseMode.MARKDOWN_V2)
         return ConversationHandler.END
 
     if ":page:" in data:
         page = int(data.split(":")[-1])
         text = _info_text(info) + f"\n\n📋 *{len(eps)} episodi disponibili*"
-        await query.edit_message_text(
+        await q.edit_message_text(
             text,
             reply_markup=_episodes_keyboard(eps, "au_e", page),
             parse_mode=ParseMode.MARKDOWN_V2,
@@ -279,17 +301,16 @@ async def au_pick_episode(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int
         return AU_EPISODES
 
     if data.endswith(":all"):
-        await query.edit_message_text(
+        await q.edit_message_text(
             f"⏳ Estraggo tutti i {len(eps)} link\\. Potrebbe richiedere qualche minuto…",
             parse_mode=ParseMode.MARKDOWN_V2,
         )
-        await _au_send_links(query, ctx, eps)
+        await _au_send_links(q, ctx, eps)
         return ConversationHandler.END
 
-    # Episodio singolo
     ep_idx = int(data.split(":")[-1])
     ep     = eps[ep_idx]
-    await query.edit_message_text(
+    await q.edit_message_text(
         f"⏳ Estraggo *{_esc(_ep_label(ep))}*…", parse_mode=ParseMode.MARKDOWN_V2
     )
     try:
@@ -297,20 +318,18 @@ async def au_pick_episode(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int
             None, _au(ctx).get_episode_link, ep["url"]
         )
     except Exception as e:
-        await query.edit_message_text(f"❌ Errore: {_esc(str(e))}", parse_mode=ParseMode.MARKDOWN_V2)
+        await q.edit_message_text(f"❌ Errore: {_esc(str(e))}", parse_mode=ParseMode.MARKDOWN_V2)
         return ConversationHandler.END
 
-    await query.edit_message_text(
+    await q.edit_message_text(
         _link_text(_ep_label(ep), m3u8), parse_mode=ParseMode.MARKDOWN_V2
     )
     return ConversationHandler.END
 
-async def _au_send_links(query: Any, ctx: ContextTypes.DEFAULT_TYPE, eps: list[dict]) -> None:
-    """Estrae e manda i link M3U8 di tutti gli episodi, a blocchi."""
+async def _au_send_links(q: Any, ctx: ContextTypes.DEFAULT_TYPE, eps: list[dict]) -> None:
     au   = _au(ctx)
-    chat = query.message.chat_id
+    chat = q.message.chat_id
     bot  = ctx.bot
-
     for ep in eps:
         try:
             m3u8 = await asyncio.get_event_loop().run_in_executor(
@@ -323,8 +342,7 @@ async def _au_send_links(query: Any, ctx: ContextTypes.DEFAULT_TYPE, eps: list[d
             )
         except Exception as e:
             await bot.send_message(chat_id=chat, text=f"❌ {_ep_label(ep)}: {e}")
-        await asyncio.sleep(0.3)  # evita flood
-
+        await asyncio.sleep(0.4)
 
 # ---------------------------------------------------------------------------
 # ── STREAMING COMMUNITY ─────────────────────────────────────────────────────
@@ -364,35 +382,31 @@ async def cmd_film(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     return SC_RESULTS
 
 async def sc_pick_result(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    data = query.data
+    q = update.callback_query
+    await _safe_answer(q)
 
-    if data.endswith(":cancel"):
-        await query.edit_message_text("Annullato\\.", parse_mode=ParseMode.MARKDOWN_V2)
+    if q.data.endswith(":cancel"):
+        await q.edit_message_text("Annullato\\.", parse_mode=ParseMode.MARKDOWN_V2)
         return ConversationHandler.END
 
-    idx     = int(data.split(":")[1])
-    results = ctx.user_data["sc_results"]
-    chosen  = results[idx]
+    idx    = int(q.data.split(":")[1])
+    chosen = ctx.user_data["sc_results"][idx]
+    name   = _get_title(chosen)
 
-    await query.edit_message_text(
-        f"⏳ Carico *{_esc(chosen['name'])}*…", parse_mode=ParseMode.MARKDOWN_V2
+    await q.edit_message_text(
+        f"⏳ Carico *{_esc(name)}*…", parse_mode=ParseMode.MARKDOWN_V2
     )
-
     try:
-        info = await asyncio.get_event_loop().run_in_executor(
-            None, _sc(ctx).load, chosen["url"]
-        )
+        info = await asyncio.get_event_loop().run_in_executor(None, _sc(ctx).load, chosen["url"])
     except Exception as e:
-        await query.edit_message_text(f"❌ Errore: {_esc(str(e))}", parse_mode=ParseMode.MARKDOWN_V2)
+        await q.edit_message_text(f"❌ Errore: {_esc(str(e))}", parse_mode=ParseMode.MARKDOWN_V2)
         return ConversationHandler.END
 
     ctx.user_data["sc_info"] = info
 
-    # ── Film: estrai subito il link ──────────────────────────────────────────
+    # Film → link diretto
     if info["type"] == "movie":
-        await query.edit_message_text(
+        await q.edit_message_text(
             f"⏳ Film trovato\\. Estraggo il link…", parse_mode=ParseMode.MARKDOWN_V2
         )
         try:
@@ -400,21 +414,23 @@ async def sc_pick_result(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
                 None, _sc(ctx).get_movie_link, info
             )
         except Exception as e:
-            await query.edit_message_text(f"❌ Errore: {_esc(str(e))}", parse_mode=ParseMode.MARKDOWN_V2)
+            await q.edit_message_text(f"❌ Errore: {_esc(str(e))}", parse_mode=ParseMode.MARKDOWN_V2)
             return ConversationHandler.END
 
-        text = _info_text(info) + "\n\n" + _link_text(info["name"], m3u8)
-        await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN_V2)
+        await q.edit_message_text(
+            _info_text(info) + "\n\n" + _link_text(name, m3u8),
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
         return ConversationHandler.END
 
-    # ── Serie TV: mostra episodi ─────────────────────────────────────────────
+    # Serie → episodi
     eps = info.get("episodes", [])
     if not eps:
-        await query.edit_message_text("Nessun episodio disponibile\\.", parse_mode=ParseMode.MARKDOWN_V2)
+        await q.edit_message_text("Nessun episodio disponibile\\.", parse_mode=ParseMode.MARKDOWN_V2)
         return ConversationHandler.END
 
     text = _info_text(info) + f"\n\n📋 *{len(eps)} episodi disponibili*"
-    await query.edit_message_text(
+    await q.edit_message_text(
         text,
         reply_markup=_episodes_keyboard(eps, "sc_e"),
         parse_mode=ParseMode.MARKDOWN_V2,
@@ -422,20 +438,20 @@ async def sc_pick_result(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     return SC_EPISODES
 
 async def sc_pick_episode(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    data = query.data
+    q    = update.callback_query
+    await _safe_answer(q)
+    data = q.data
     info = ctx.user_data["sc_info"]
     eps  = info["episodes"]
 
     if data.endswith(":cancel"):
-        await query.edit_message_text("Annullato\\.", parse_mode=ParseMode.MARKDOWN_V2)
+        await q.edit_message_text("Annullato\\.", parse_mode=ParseMode.MARKDOWN_V2)
         return ConversationHandler.END
 
     if ":page:" in data:
         page = int(data.split(":")[-1])
         text = _info_text(info) + f"\n\n📋 *{len(eps)} episodi disponibili*"
-        await query.edit_message_text(
+        await q.edit_message_text(
             text,
             reply_markup=_episodes_keyboard(eps, "sc_e", page),
             parse_mode=ParseMode.MARKDOWN_V2,
@@ -443,16 +459,16 @@ async def sc_pick_episode(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int
         return SC_EPISODES
 
     if data.endswith(":all"):
-        await query.edit_message_text(
+        await q.edit_message_text(
             f"⏳ Estraggo tutti i {len(eps)} link\\. Potrebbe richiedere qualche minuto…",
             parse_mode=ParseMode.MARKDOWN_V2,
         )
-        await _sc_send_links(query, ctx, eps)
+        await _sc_send_links(q, ctx, eps)
         return ConversationHandler.END
 
     ep_idx = int(data.split(":")[-1])
     ep     = eps[ep_idx]
-    await query.edit_message_text(
+    await q.edit_message_text(
         f"⏳ Estraggo *{_esc(_ep_label(ep))}*…", parse_mode=ParseMode.MARKDOWN_V2
     )
     try:
@@ -460,19 +476,18 @@ async def sc_pick_episode(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int
             None, _sc(ctx).get_episode_link, ep
         )
     except Exception as e:
-        await query.edit_message_text(f"❌ Errore: {_esc(str(e))}", parse_mode=ParseMode.MARKDOWN_V2)
+        await q.edit_message_text(f"❌ Errore: {_esc(str(e))}", parse_mode=ParseMode.MARKDOWN_V2)
         return ConversationHandler.END
 
-    await query.edit_message_text(
+    await q.edit_message_text(
         _link_text(_ep_label(ep), m3u8), parse_mode=ParseMode.MARKDOWN_V2
     )
     return ConversationHandler.END
 
-async def _sc_send_links(query: Any, ctx: ContextTypes.DEFAULT_TYPE, eps: list[dict]) -> None:
+async def _sc_send_links(q: Any, ctx: ContextTypes.DEFAULT_TYPE, eps: list[dict]) -> None:
     sc   = _sc(ctx)
-    chat = query.message.chat_id
+    chat = q.message.chat_id
     bot  = ctx.bot
-
     for ep in eps:
         try:
             m3u8 = await asyncio.get_event_loop().run_in_executor(
@@ -485,11 +500,10 @@ async def _sc_send_links(query: Any, ctx: ContextTypes.DEFAULT_TYPE, eps: list[d
             )
         except Exception as e:
             await bot.send_message(chat_id=chat, text=f"❌ {_ep_label(ep)}: {e}")
-        await asyncio.sleep(0.3)
-
+        await asyncio.sleep(0.4)
 
 # ---------------------------------------------------------------------------
-# Fallback
+# /cancel
 # ---------------------------------------------------------------------------
 
 async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -504,7 +518,6 @@ def main() -> None:
     token = os.environ["TELEGRAM_TOKEN"]
     app   = Application.builder().token(token).build()
 
-    # ── ConversationHandler AnimeUnity ───────────────────────────────────────
     au_conv = ConversationHandler(
         entry_points=[CommandHandler("anime", cmd_anime)],
         states={
@@ -515,7 +528,6 @@ def main() -> None:
         per_message=False,
     )
 
-    # ── ConversationHandler StreamingCommunity ───────────────────────────────
     sc_conv = ConversationHandler(
         entry_points=[CommandHandler("film", cmd_film)],
         states={
@@ -530,6 +542,7 @@ def main() -> None:
     app.add_handler(CommandHandler("help",  cmd_help))
     app.add_handler(au_conv)
     app.add_handler(sc_conv)
+    app.add_error_handler(error_handler)
 
     log.info("Bot avviato in polling...")
     app.run_polling(drop_pending_updates=True)
