@@ -8,6 +8,7 @@ Variabili d'ambiente richieste:
 """
 
 import asyncio
+import io
 import logging
 import os
 import re
@@ -16,6 +17,7 @@ from typing import Any
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InputFile,
     Update,
 )
 from telegram.constants import ParseMode
@@ -30,8 +32,8 @@ from telegram.ext import (
     filters,
 )
 
-from animeunity import AnimeUnity
-from streamingcommunity import StreamingCommunity
+from animeunity import AnimeUnity, MAIN_URL as AU_URL
+from streamingcommunity import StreamingCommunity, MAIN_URL as SC_URL
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -146,13 +148,60 @@ def _info_text(info: dict) -> str:
         lines.append(f"\n_{_esc(short)}_")
     return "\n".join(lines)
 
-def _link_text(label: str, m3u8: str | None) -> str:
-    if not m3u8:
-        return f"❌ Link non trovato per *{_esc(label)}*\\."
+def _make_m3u(label: str, m3u8: str, referer: str) -> io.BytesIO:
+    """
+    Genera un file .m3u8 con direttive #EXTVLCOPT per impostare
+    il Referer header — necessario perché VixCloud blocca con 403
+    le richieste senza Referer corretto.
+    Funziona con VLC, mpv, e qualsiasi player che supporta .m3u8.
+    """
+    content = (
+        "#EXTM3U\n"
+        f"#EXTINF:-1,{label}\n"
+        f"#EXTVLCOPT:http-referrer={referer}\n"
+        f"#EXTVLCOPT:network-caching=1000\n"
+        f"{m3u8}\n"
+    )
+    buf = io.BytesIO(content.encode("utf-8"))
+    buf.name = f"{re.sub(r'[^\\w\\s-]', '', label)[:40]}.m3u8"
+    return buf
+
+def _link_caption(label: str, m3u8: str) -> str:
+    """Testo della didascalia allegata al file .m3u8."""
     return (
         f"✅ *{_esc(label)}*\n\n"
-        f"`{_esc(m3u8)}`\n\n"
-        f"Copia il link e aprilo con mpv o VLC\\."
+        f"Apri il file \\. m3u8 con VLC o mpv\\.\n\n"
+        f"Oppure copia il link raw:\n"
+        f"`{_esc(m3u8)}`"
+    )
+
+async def _send_link(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    label: str,
+    m3u8: str | None,
+    referer: str,
+    reply_to_message_id: int | None = None,
+) -> None:
+    """
+    Manda il link M3U8 come file .m3u8 allegato (con Referer) + testo.
+    Se m3u8 è None manda solo il messaggio di errore.
+    """
+    if not m3u8:
+        await ctx.bot.send_message(
+            chat_id=chat_id,
+            text=f"❌ Link non trovato per *{_esc(label)}*\\.",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+        return
+
+    m3u_file = _make_m3u(label, m3u8, referer)
+    await ctx.bot.send_document(
+        chat_id=chat_id,
+        document=InputFile(m3u_file, filename=m3u_file.name),
+        caption=_link_caption(label, m3u8),
+        parse_mode=ParseMode.MARKDOWN_V2,
+        reply_to_message_id=reply_to_message_id,
     )
 
 async def _safe_answer(query) -> None:
@@ -321,27 +370,21 @@ async def au_pick_episode(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int
         await q.edit_message_text(f"❌ Errore: {_esc(str(e))}", parse_mode=ParseMode.MARKDOWN_V2)
         return ConversationHandler.END
 
-    await q.edit_message_text(
-        _link_text(_ep_label(ep), m3u8), parse_mode=ParseMode.MARKDOWN_V2
-    )
+    await q.edit_message_text("✅ Link estratto\\! Invio il file…", parse_mode=ParseMode.MARKDOWN_V2)
+    await _send_link(ctx, q.message.chat_id, _ep_label(ep), m3u8, referer=AU_URL)
     return ConversationHandler.END
 
 async def _au_send_links(q: Any, ctx: ContextTypes.DEFAULT_TYPE, eps: list[dict]) -> None:
     au   = _au(ctx)
     chat = q.message.chat_id
-    bot  = ctx.bot
     for ep in eps:
         try:
             m3u8 = await asyncio.get_event_loop().run_in_executor(
                 None, au.get_episode_link, ep["url"]
             )
-            await bot.send_message(
-                chat_id=chat,
-                text=_link_text(_ep_label(ep), m3u8),
-                parse_mode=ParseMode.MARKDOWN_V2,
-            )
+            await _send_link(ctx, chat, _ep_label(ep), m3u8, referer=AU_URL)
         except Exception as e:
-            await bot.send_message(chat_id=chat, text=f"❌ {_ep_label(ep)}: {e}")
+            await ctx.bot.send_message(chat_id=chat, text=f"❌ {_ep_label(ep)}: {e}")
         await asyncio.sleep(0.4)
 
 # ---------------------------------------------------------------------------
@@ -418,9 +461,10 @@ async def sc_pick_result(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
             return ConversationHandler.END
 
         await q.edit_message_text(
-            _info_text(info) + "\n\n" + _link_text(name, m3u8),
+            _info_text(info) + "\n\n✅ Link estratto\\! Invio il file…",
             parse_mode=ParseMode.MARKDOWN_V2,
         )
+        await _send_link(ctx, q.message.chat_id, name, m3u8, referer=SC_URL)
         return ConversationHandler.END
 
     # Serie → episodi
@@ -479,27 +523,21 @@ async def sc_pick_episode(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int
         await q.edit_message_text(f"❌ Errore: {_esc(str(e))}", parse_mode=ParseMode.MARKDOWN_V2)
         return ConversationHandler.END
 
-    await q.edit_message_text(
-        _link_text(_ep_label(ep), m3u8), parse_mode=ParseMode.MARKDOWN_V2
-    )
+    await q.edit_message_text("✅ Link estratto\\! Invio il file…", parse_mode=ParseMode.MARKDOWN_V2)
+    await _send_link(ctx, q.message.chat_id, _ep_label(ep), m3u8, referer=SC_URL)
     return ConversationHandler.END
 
 async def _sc_send_links(q: Any, ctx: ContextTypes.DEFAULT_TYPE, eps: list[dict]) -> None:
     sc   = _sc(ctx)
     chat = q.message.chat_id
-    bot  = ctx.bot
     for ep in eps:
         try:
             m3u8 = await asyncio.get_event_loop().run_in_executor(
                 None, sc.get_episode_link, ep
             )
-            await bot.send_message(
-                chat_id=chat,
-                text=_link_text(_ep_label(ep), m3u8),
-                parse_mode=ParseMode.MARKDOWN_V2,
-            )
+            await _send_link(ctx, chat, _ep_label(ep), m3u8, referer=SC_URL)
         except Exception as e:
-            await bot.send_message(chat_id=chat, text=f"❌ {_ep_label(ep)}: {e}")
+            await ctx.bot.send_message(chat_id=chat, text=f"❌ {_ep_label(ep)}: {e}")
         await asyncio.sleep(0.4)
 
 # ---------------------------------------------------------------------------
